@@ -31,9 +31,7 @@ class DataAnalyzer:
         return z_data
 
     def fit_gaussian_profile(self, image_crop):
-        # Convert to uint8 for safe OpenCV processing
         image_crop = np.clip(image_crop, 0, 255).astype(np.uint8)
-
         if len(image_crop.shape) == 3:
             gray_crop = cv2.cvtColor(image_crop, cv2.COLOR_RGB2GRAY)
         else:
@@ -44,7 +42,6 @@ class DataAnalyzer:
 
         a_guess = np.max(y_profile) - np.min(y_profile)
         mu_guess = x_data[np.argmax(y_profile)]
-        # Ensure sigma_guess is never zero
         sigma_guess = max(len(x_data) / 4.0, 1.0) 
         c_guess = np.min(y_profile)
 
@@ -57,6 +54,12 @@ class DataAnalyzer:
                 maxfev=2000
             )
             y_fit = self.gaussian(x_data, *popt)
-            return x_data, y_profile, y_fit
+            # popt contains: [Amplitude, Center (mu), Width (sigma), Baseline (c)]
+            metrics = {
+                "amplitude": popt[0],
+                "centroid": popt[1],
+                "sigma": abs(popt[2])
+            }
+            return x_data, y_profile, y_fit, metrics
         except RuntimeError:
-            return x_data, y_profile, np.full_like(x_data, c_guess)
+            return x_data, y_profile, np.full_like(x_data, c_guess), None

@@ -1,4 +1,5 @@
 import os
+import sys
 
 class KaggleScraper:
     def __init__(self):
@@ -6,17 +7,29 @@ class KaggleScraper:
         self.authenticated = False
 
     def authenticate_api(self, username, key):
-        # Inject credentials into the environment variables for this session only
+        # 1. Inject credentials into the environment
         os.environ['KAGGLE_USERNAME'] = username
         os.environ['KAGGLE_KEY'] = key
         
         try:
-            # LAZY IMPORT: Prevents Kaggle from crashing the app on startup
+            # 2. Forcibly clear Kaggle from Python's memory cache.
+            # This prevents Python from remembering a previously failed auth state
+            # and forces it to read the new environment variables.
+            modules_to_remove = [mod for mod in sys.modules if mod.startswith('kaggle')]
+            for mod in modules_to_remove:
+                del sys.modules[mod]
+                
+            # 3. Import and Authenticate freshly
             from kaggle.api.kaggle_api_extended import KaggleApi
+            
             self.api = KaggleApi()
             self.api.authenticate()
+            
+            # 4. Quick silent test to confirm the credentials are truly valid
+            self.api.dataset_list(search='test', max_size=1)
+            
             self.authenticated = True
-            return True, "Authentication successful."
+            return True, "Authentication successful. You can now search."
         except Exception as e:
             self.authenticated = False
             return False, f"Auth Error: {str(e)}"

@@ -1,16 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules
-
-hiddenimports = ['pyqtgraph.graphicsItems', 'pyqtgraph.opengl', 'OpenGL', 'scipy.special._cdflib', 'kaggle']
-hiddenimports += collect_submodules('ultralytics')
 
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('yolov8n.pt', '.')],
-    hiddenimports=hiddenimports,
+    datas=[],
+    hiddenimports=['pyqtgraph.graphicsItems', 'scipy.special._cdflib', 'kaggle'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
