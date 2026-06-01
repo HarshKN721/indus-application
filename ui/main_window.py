@@ -4,6 +4,7 @@ import numpy as np
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFileDialog, QTabWidget, 
                              QSlider, QMessageBox, QLineEdit, QListWidget, QDialog, QFormLayout)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtCore import Qt
 import pyqtgraph as pg
 
@@ -13,6 +14,20 @@ from matplotlib.figure import Figure
 
 from core.analysis import DataAnalyzer
 from data_fetcher.kaggle_client import KaggleScraper
+
+class DownloadThread(QThread):
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, scraper, dataset_ref, download_dir):
+        super().__init__()
+        self.scraper = scraper
+        self.dataset_ref = dataset_ref
+        self.download_dir = download_dir
+
+    def run(self):
+        # This runs safely in the background without freezing the UI
+        success, msg = self.scraper.download_dataset(self.dataset_ref, self.download_dir)
+        self.finished.emit(success, msg)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -108,6 +123,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         
         control_layout = QHBoxLayout()
+        
+        # 1. CREATE WIDGETS FIRST
         self.upload_btn = QPushButton("Upload Image")
         self.upload_btn.clicked.connect(self.load_image)
         
@@ -124,18 +141,38 @@ class MainWindow(QMainWindow):
         self.scale_slider.setValue(50)
         self.scale_slider.setFixedWidth(150)
         
+        # New Info Button for the Slider
+        self.info_btn = QPushButton("?")
+        self.info_btn.setFixedSize(24, 24)
+        self.info_btn.setStyleSheet("border-radius: 12px; background-color: #0078d4; color: white; font-weight: bold; border: none;")
+        self.info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+        # The ToolTip contains the explanation and hard limits
+        self.info_btn.setToolTip(
+            "<b>Mesh Resolution Downscaler:</b><br><br>"
+            "Rendering 3D scientific data is computationally intensive on the CPU. "
+            "To prevent the application from freezing, the selected Region of Interest (ROI) is dynamically downscaled before mesh generation.<br><br>"
+            "<b>Hard Limits:</b><br>"
+            "• At 100% scale, the max dimension is strictly capped at <b>150 pixels</b>.<br>"
+            "• At 10% scale, the max dimension is strictly capped at <b>15 pixels</b>."
+        )
+        
         self.status_label = QLabel("Status: Waiting for image...")
         
+        # 2. ADD WIDGETS TO LAYOUT SECOND
         control_layout.addWidget(self.upload_btn)
         control_layout.addWidget(self.add_roi_btn)
         control_layout.addWidget(self.analyze_btn)
         control_layout.addSpacing(20)
         control_layout.addWidget(QLabel("Mesh Res:"))
         control_layout.addWidget(self.scale_slider)
+        control_layout.addWidget(self.info_btn) # Add the info button right beside the slider
         control_layout.addStretch()
+        
         layout.addLayout(control_layout)
         layout.addWidget(self.status_label)
 
+        # 3. SETUP IMAGE CANVAS
         pg.setConfigOptions(imageAxisOrder='row-major')
         self.image_widget = pg.PlotWidget()
         self.image_widget.invertY(True)
@@ -180,6 +217,7 @@ class MainWindow(QMainWindow):
         self.math_widget = pg.PlotWidget(title="Gaussian Beam Profile")
         self.math_widget.setBackground('w')
         self.math_widget.showGrid(x=True, y=True)
+        self.math_widget.addLegend()
         layout.addWidget(self.math_widget)
         
         self.tabs.addTab(tab, "3. Diagnostic Math")
@@ -188,6 +226,8 @@ class MainWindow(QMainWindow):
     def setup_scraping_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        
+        # 1. Credentials Layout
         cred_layout = QHBoxLayout()
         self.k_user = QLineEdit()
         self.k_user.setPlaceholderText("Kaggle Username")
@@ -200,6 +240,7 @@ class MainWindow(QMainWindow):
         cred_layout.addWidget(self.k_key)
         cred_layout.addWidget(self.auth_btn)
         
+        # 2. Search Layout
         search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search Datasets (e.g., 'laser profile')")
@@ -208,10 +249,27 @@ class MainWindow(QMainWindow):
         search_layout.addWidget(self.search_input)
         search_layout.addWidget(self.search_btn)
         
+        # 3. Results List
         self.results_list = QListWidget()
+        self.results_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        
+        # 4. Download Button
+        self.download_btn = QPushButton("Download Selected Dataset")
+        self.download_btn.setEnabled(False) # Disabled until an item is clicked
+        self.download_btn.setStyleSheet("background-color: #107c10; font-weight: bold;")
+        self.download_btn.clicked.connect(self.download_kaggle_dataset)
+        
+        # Enable button only when an item is selected
+        self.results_list.itemSelectionChanged.connect(
+            lambda: self.download_btn.setEnabled(bool(self.results_list.selectedItems()))
+        )
+
+        # 5. Assemble everything onto the main layout exactly ONCE
         layout.addLayout(cred_layout)
         layout.addLayout(search_layout)
         layout.addWidget(self.results_list)
+        layout.addWidget(self.download_btn)
+        
         self.tabs.addTab(tab, "4. Data Scraper")
 
     def authenticate_kaggle(self):
@@ -240,6 +298,9 @@ class MainWindow(QMainWindow):
             img = cv2.imread(file_path)
             self.current_image_data = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             self.image_item.setImage(self.current_image_data)
+            
+            # --- FIX: Force the camera to zoom out and fit the new image ---
+            self.plot_item.autoRange()
             
             for item in self.active_rois:
                 self.plot_item.removeItem(item)
@@ -310,3 +371,45 @@ class MainWindow(QMainWindow):
 
         self.status_label.setText("Analysis Complete.")
         self.tabs.setCurrentIndex(1)
+
+    def download_kaggle_dataset(self):
+        selected_items = self.results_list.selectedItems()
+        if not selected_items:
+            return
+
+        item_text = selected_items[0].text()
+        
+        if "Authentication Required" in item_text or "No datasets found" in item_text:
+            return
+
+        try:
+            lines = item_text.split('\n')
+            ref_line = [line for line in lines if line.startswith("Ref:")][0]
+            dataset_ref = ref_line.replace("Ref:", "").strip()
+        except IndexError:
+            QMessageBox.warning(self, "Parse Error", "Could not extract dataset reference.")
+            return
+
+        download_dir = QFileDialog.getExistingDirectory(self, "Select Download Directory")
+        if not download_dir:
+            return 
+
+        self.results_list.addItem(f"Downloading '{dataset_ref}'... Please wait.")
+        self.download_btn.setEnabled(False) # Prevent clicking download twice
+        self.download_btn.setText("Downloading...")
+        
+        # Start the background thread
+        self.dl_thread = DownloadThread(self.scraper, dataset_ref, download_dir)
+        self.dl_thread.finished.connect(self.on_download_finished)
+        self.dl_thread.start()
+
+    def on_download_finished(self, success, msg):
+        # This runs when the background thread finishes
+        self.results_list.takeItem(self.results_list.count() - 1)
+        self.download_btn.setEnabled(True)
+        self.download_btn.setText("Download Selected Dataset")
+        
+        if success:
+            QMessageBox.information(self, "Download Complete", msg)
+        else:
+            QMessageBox.critical(self, "Download Error", msg)
