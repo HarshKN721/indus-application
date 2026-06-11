@@ -16,7 +16,6 @@ class DataAnalyzer:
             gray_crop = image_crop
             
         # Performance fix: Strictly cap the maximum number of vertices
-        # 100% scale = max 150 pixels. 10% scale = max 15 pixels.
         max_dim = max(10, int(150 * (scale_percent / 100.0)))
         
         h, w = gray_crop.shape
@@ -63,3 +62,41 @@ class DataAnalyzer:
             return x_data, y_profile, y_fit, metrics
         except RuntimeError:
             return x_data, y_profile, np.full_like(x_data, c_guess), None
+
+    def find_auto_roi(self, image_data):
+        """Automatically detects the brightest region (beam) and returns a bounding box [x, y, w, h]"""
+        # Convert to grayscale
+        if len(image_data.shape) == 3:
+            gray = cv2.cvtColor(image_data, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image_data.copy()
+
+        # Blur and threshold to isolate the beam
+        blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+        
+        # Determine a dynamic threshold based on max intensity
+        max_val = np.max(blurred)
+        thresh_val = max(50, max_val * 0.5) # Threshold at 50% of max brightness
+        _, thresh = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
+        
+        # Find contours
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            # Fallback if no beam found: center square
+            h, w = gray.shape
+            return [w//2 - 50, h//2 - 50, 100, 100]
+            
+        # Get the largest contour (assuming it's the primary beam)
+        largest_contour = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest_contour)
+        
+        # Add slight padding (e.g., 20 pixels) to ensure the whole Gaussian tail is captured
+        pad = 20
+        h_img, w_img = gray.shape
+        x_padded = max(0, x - pad)
+        y_padded = max(0, y - pad)
+        w_padded = min(w_img - x_padded, w + 2*pad)
+        h_padded = min(h_img - y_padded, h + 2*pad)
+        
+        return [x_padded, y_padded, w_padded, h_padded]

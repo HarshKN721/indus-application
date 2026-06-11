@@ -3,9 +3,8 @@ import cv2
 import numpy as np
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFileDialog, QTabWidget, 
-                             QSlider, QMessageBox, QLineEdit, QListWidget, QDialog, QFormLayout)
+                             QSlider, QMessageBox, QLineEdit, QDialog, QFormLayout)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtCore import Qt
 import pyqtgraph as pg
 
 # Matplotlib Imports for the 3D Canvas
@@ -13,21 +12,29 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from core.analysis import DataAnalyzer
-from data_fetcher.kaggle_client import KaggleScraper
 
-class DownloadThread(QThread):
-    finished = pyqtSignal(bool, str)
+# --- ASYNC WORKER THREAD ---
+class AnalysisWorker(QThread):
+    # Signals to communicate back to the main UI thread safely
+    finished = pyqtSignal(object, object, object, object, object)
+    error = pyqtSignal(str)
 
-    def __init__(self, scraper, dataset_ref, download_dir):
+    def __init__(self, analyzer, region, scale_percent):
         super().__init__()
-        self.scraper = scraper
-        self.dataset_ref = dataset_ref
-        self.download_dir = download_dir
+        self.analyzer = analyzer
+        self.region = region
+        self.scale_percent = scale_percent
 
     def run(self):
-        # This runs safely in the background without freezing the UI
-        success, msg = self.scraper.download_dataset(self.dataset_ref, self.download_dir)
-        self.finished.emit(success, msg)
+        try:
+            # Heavy mathematical processing happens here on a background thread
+            z_data = self.analyzer.prepare_mesh_data(self.region, self.scale_percent)
+            x_data, raw_profile, fit_profile, metrics = self.analyzer.fit_gaussian_profile(self.region)
+            
+            # Emit results back to the GUI
+            self.finished.emit(z_data, x_data, raw_profile, fit_profile, metrics)
+        except Exception as e:
+            self.error.emit(str(e))
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -36,11 +43,9 @@ class MainWindow(QMainWindow):
         self.resize(1200, 900)
         
         self.is_dark_mode = False
-        self.apply_theme()
+        self.apply_theme() # This now properly references the method below!
 
-        # Notice VisionProcessor is gone. We only need the math and scraper now.
         self.analyzer = DataAnalyzer()
-        self.scraper = KaggleScraper()
         
         self.current_image_data = None
         self.active_rois = []
@@ -56,9 +61,8 @@ class MainWindow(QMainWindow):
         self.setup_vision_tab()
         self.setup_mesh_tab()
         self.setup_math_tab()
-        self.setup_scraping_tab()
+        self.setup_roc_tab()
 
-    # ... [Keep your existing setup_toolbar, configure_proxy, toggle_theme, and apply_theme methods here] ...
     def setup_toolbar(self):
         toolbar_layout = QHBoxLayout()
         self.proxy_btn = QPushButton("Configure Network Proxy")
@@ -115,7 +119,7 @@ class MainWindow(QMainWindow):
             QTabWidget::pane {{ border: 1px solid #a0a0a0; background: {pane_color}; border-radius: 8px; }}
             QTabBar::tab {{ background: {tab_inactive}; padding: 10px 20px; border-top-left-radius: 8px; border-top-right-radius: 8px; }}
             QTabBar::tab:selected {{ background: {pane_color}; border-bottom: 2px solid #0078d4; font-weight: bold; }}
-            QLineEdit, QListWidget {{ padding: 6px; border: 1px solid #ccc; border-radius: 4px; background: {pane_color}; color: {text_color}; }}
+            QLineEdit {{ padding: 6px; border: 1px solid #ccc; border-radius: 4px; background: {pane_color}; color: {text_color}; }}
         """)
 
     def setup_vision_tab(self):
@@ -124,13 +128,19 @@ class MainWindow(QMainWindow):
         
         control_layout = QHBoxLayout()
         
-        # 1. CREATE WIDGETS FIRST
+        # Widgets
         self.upload_btn = QPushButton("Upload Image")
         self.upload_btn.clicked.connect(self.load_image)
         
         self.add_roi_btn = QPushButton("Draw Manual ROI")
         self.add_roi_btn.clicked.connect(self.add_manual_roi)
-        self.add_roi_btn.setEnabled(False) # Disabled until image is loaded
+        self.add_roi_btn.setEnabled(False) 
+        
+        # New Auto-ROI Button
+        self.auto_roi_btn = QPushButton("Auto-ROI")
+        self.auto_roi_btn.clicked.connect(self.add_auto_roi)
+        self.auto_roi_btn.setEnabled(False)
+        self.auto_roi_btn.setStyleSheet("background-color: #d83b01;") 
         
         self.analyze_btn = QPushButton("Analyze Beam")
         self.analyze_btn.clicked.connect(self.run_analysis)
@@ -141,13 +151,11 @@ class MainWindow(QMainWindow):
         self.scale_slider.setValue(50)
         self.scale_slider.setFixedWidth(150)
         
-        # New Info Button for the Slider
+        # Preserved Info Button
         self.info_btn = QPushButton("?")
         self.info_btn.setFixedSize(24, 24)
         self.info_btn.setStyleSheet("border-radius: 12px; background-color: #0078d4; color: white; font-weight: bold; border: none;")
         self.info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        
-        # The ToolTip contains the explanation and hard limits
         self.info_btn.setToolTip(
             "<b>Mesh Resolution Downscaler:</b><br><br>"
             "Rendering 3D scientific data is computationally intensive on the CPU. "
@@ -159,20 +167,19 @@ class MainWindow(QMainWindow):
         
         self.status_label = QLabel("Status: Waiting for image...")
         
-        # 2. ADD WIDGETS TO LAYOUT SECOND
         control_layout.addWidget(self.upload_btn)
         control_layout.addWidget(self.add_roi_btn)
+        control_layout.addWidget(self.auto_roi_btn)
         control_layout.addWidget(self.analyze_btn)
         control_layout.addSpacing(20)
         control_layout.addWidget(QLabel("Mesh Res:"))
         control_layout.addWidget(self.scale_slider)
-        control_layout.addWidget(self.info_btn) # Add the info button right beside the slider
+        control_layout.addWidget(self.info_btn) 
         control_layout.addStretch()
         
         layout.addLayout(control_layout)
         layout.addWidget(self.status_label)
 
-        # 3. SETUP IMAGE CANVAS
         pg.setConfigOptions(imageAxisOrder='row-major')
         self.image_widget = pg.PlotWidget()
         self.image_widget.invertY(True)
@@ -191,12 +198,10 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # --- NEW MATPLOTLIB 3D INTEGRATION ---
         self.fig = Figure(figsize=(8, 6), dpi=100)
         self.canvas = FigureCanvas(self.fig)
         self.ax = self.fig.add_subplot(111, projection='3d')
         
-        # Make the background match our theme
         self.fig.patch.set_facecolor('#fafafa')
         self.ax.set_facecolor('#fafafa')
         self.ax.set_title("Interactive Beam Intensity Topography")
@@ -208,12 +213,10 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # Diagnostic Metrics Label
         self.metrics_label = QLabel("Beam Metrics: Pending Analysis...")
         self.metrics_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #0067c0; padding: 10px;")
         layout.addWidget(self.metrics_label)
         
-        # We removed the ROC curve and gave Gaussian the full window
         self.math_widget = pg.PlotWidget(title="Gaussian Beam Profile")
         self.math_widget.setBackground('w')
         self.math_widget.showGrid(x=True, y=True)
@@ -222,84 +225,24 @@ class MainWindow(QMainWindow):
         
         self.tabs.addTab(tab, "3. Diagnostic Math")
 
-    # ... [Keep your existing setup_scraping_tab and authenticate_kaggle methods here] ...
-    def setup_scraping_tab(self):
+    def setup_roc_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        
-        # 1. Credentials Layout
-        cred_layout = QHBoxLayout()
-        self.k_user = QLineEdit()
-        self.k_user.setPlaceholderText("Kaggle Username")
-        self.k_key = QLineEdit()
-        self.k_key.setPlaceholderText("Kaggle API Key")
-        self.k_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.auth_btn = QPushButton("Authenticate API")
-        self.auth_btn.clicked.connect(self.authenticate_kaggle)
-        cred_layout.addWidget(self.k_user)
-        cred_layout.addWidget(self.k_key)
-        cred_layout.addWidget(self.auth_btn)
-        
-        # 2. Search Layout
-        search_layout = QHBoxLayout()
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search Datasets (e.g., 'laser profile')")
-        self.search_btn = QPushButton("Search")
-        self.search_btn.clicked.connect(self.run_kaggle_search)
-        search_layout.addWidget(self.search_input)
-        search_layout.addWidget(self.search_btn)
-        
-        # 3. Results List
-        self.results_list = QListWidget()
-        self.results_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
-        
-        # 4. Download Button
-        self.download_btn = QPushButton("Download Selected Dataset")
-        self.download_btn.setEnabled(False) # Disabled until an item is clicked
-        self.download_btn.setStyleSheet("background-color: #107c10; font-weight: bold;")
-        self.download_btn.clicked.connect(self.download_kaggle_dataset)
-        
-        # Enable button only when an item is selected
-        self.results_list.itemSelectionChanged.connect(
-            lambda: self.download_btn.setEnabled(bool(self.results_list.selectedItems()))
-        )
-
-        # 5. Assemble everything onto the main layout exactly ONCE
-        layout.addLayout(cred_layout)
-        layout.addLayout(search_layout)
-        layout.addWidget(self.results_list)
-        layout.addWidget(self.download_btn)
-        
-        self.tabs.addTab(tab, "4. Data Scraper")
-
-    def authenticate_kaggle(self):
-        user, key = self.k_user.text().strip(), self.k_key.text().strip()
-        if user and key:
-            success, msg = self.scraper.authenticate_api(user, key)
-            QMessageBox.information(self, "Kaggle Auth", msg)
-        else:
-            QMessageBox.warning(self, "Input Error", "Provide both Username and API Key.")
-            
-    def run_kaggle_search(self):
-        query = self.search_input.text().strip()
-        if query:
-            self.results_list.clear()
-            self.results_list.addItem("Searching...")
-            self.repaint()
-            results = self.scraper.search_datasets(query)
-            self.results_list.clear()
-            for res in results:
-                self.results_list.addItem(res)
+        self.roc_widget = pg.PlotWidget(title="Receiver Operating Characteristic (ROC) - Pending Implementation")
+        self.roc_widget.setBackground('w')
+        self.roc_widget.showGrid(x=True, y=True)
+        self.roc_widget.setLabel('left', 'True Positive Rate')
+        self.roc_widget.setLabel('bottom', 'False Positive Rate')
+        layout.addWidget(self.roc_widget)
+        self.tabs.addTab(tab, "4. ROC Plot")
 
     def load_image(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Images (*.png *.jpg *.jpeg)")
         if file_path:
-            # Replaced YOLO with simple OpenCV loading
             img = cv2.imread(file_path)
             self.current_image_data = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             self.image_item.setImage(self.current_image_data)
             
-            # --- FIX: Force the camera to zoom out and fit the new image ---
             self.plot_item.autoRange()
             
             for item in self.active_rois:
@@ -307,55 +250,63 @@ class MainWindow(QMainWindow):
             self.active_rois.clear()
             
             self.add_roi_btn.setEnabled(True)
-            self.status_label.setText("Image loaded. Click 'Draw Manual ROI' to select the beam.")
+            self.auto_roi_btn.setEnabled(True)
+            self.status_label.setText("Image loaded. Click 'Auto-ROI' or 'Draw Manual ROI'.")
 
     def add_manual_roi(self):
-        # Spawns a box in the middle of the image for the user to drag
         h, w, _ = self.current_image_data.shape
-        roi = pg.ROI(pos=[w//2 - 50, h//2 - 50], size=[100, 100], pen=pg.mkPen('r', width=3))
+        self.spawn_roi_box(w//2 - 50, h//2 - 50, 100, 100)
+        self.status_label.setText("Adjust the red box over the beam and click 'Analyze Beam'.")
+
+    def add_auto_roi(self):
+        if self.current_image_data is None: return
+        x, y, w, h = self.analyzer.find_auto_roi(self.current_image_data)
+        self.spawn_roi_box(x, y, w, h)
+        self.status_label.setText("Auto-ROI generated. Adjust if necessary, then click 'Analyze Beam'.")
+
+    def spawn_roi_box(self, x, y, w, h):
+        for item in self.active_rois: self.plot_item.removeItem(item)
+        self.active_rois.clear()
+        roi = pg.ROI(pos=[x, y], size=[w, h], pen=pg.mkPen('r', width=3))
         roi.addScaleHandle([1, 1], [0, 0])
         roi.addScaleHandle([0, 0], [1, 1])
         self.plot_item.addItem(roi)
         self.active_rois.append(roi)
-        self.status_label.setText("Adjust the red box over the beam and click 'Analyze Beam'.")
 
     def run_analysis(self):
         if not self.active_rois or self.current_image_data is None:
             self.status_label.setText("Error: Draw an ROI first.")
             return
 
-        self.status_label.setText("Processing Mathematics...")
-        self.repaint()
-
+        self.status_label.setText("Processing Mathematics in Background...")
+        self.analyze_btn.setEnabled(False) 
+        
         target_roi = self.active_rois[0]
         region = target_roi.getArrayRegion(self.current_image_data, self.image_item)
         scale_percent = self.scale_slider.value()
 
-        # 1. Matplotlib Mesh Processing
-        z_data = self.analyzer.prepare_mesh_data(region, scale_percent)
-        
+        # Initialize and start the QThread
+        self.worker = AnalysisWorker(self.analyzer, region, scale_percent)
+        self.worker.finished.connect(self.on_analysis_finished)
+        self.worker.error.connect(self.on_analysis_error)
+        self.worker.start()
+
+    def on_analysis_finished(self, z_data, x_data, raw_profile, fit_profile, metrics):
+        # 1. Update Matplotlib Mesh
         self.ax.clear()
-        self.fig.patch.set_facecolor('#202020' if self.is_dark_mode else '#fafafa')
-        self.ax.set_facecolor('#202020' if self.is_dark_mode else '#fafafa')
+        bg_color = '#202020' if self.is_dark_mode else '#fafafa'
+        self.fig.patch.set_facecolor(bg_color)
+        self.ax.set_facecolor(bg_color)
         
-        # Create X and Y grids for Matplotlib
-        x = np.arange(z_data.shape[1])
-        y = np.arange(z_data.shape[0])
-        X, Y = np.meshgrid(x, y)
-        
-        # Plot the interactive surface
-        surf = self.ax.plot_surface(X, Y, z_data, cmap='jet', edgecolor='none')
+        X, Y = np.meshgrid(np.arange(z_data.shape[1]), np.arange(z_data.shape[0]))
+        self.ax.plot_surface(X, Y, z_data, cmap='jet', edgecolor='none')
         self.ax.set_xlabel('X Pixel Space')
         self.ax.set_ylabel('Y Pixel Space')
         self.ax.set_zlabel('Intensity')
         self.ax.set_title("Interactive Beam Intensity Topography", color='white' if self.is_dark_mode else 'black')
-        
-        # Update the canvas drawing
         self.canvas.draw()
         
-        # 2. Gaussian Processing & Metrics
-        x_data, raw_profile, fit_profile, metrics = self.analyzer.fit_gaussian_profile(region)
-        
+        # 2. Update Gaussian Profile
         self.math_widget.clear()
         self.math_widget.plot(x_data, raw_profile, pen=pg.mkPen('b', width=2), name="Raw Profile")
         self.math_widget.plot(x_data, fit_profile, pen=pg.mkPen('r', style=Qt.PenStyle.DashLine, width=2), name="Gaussian Fit")
@@ -370,46 +321,10 @@ class MainWindow(QMainWindow):
             self.metrics_label.setText("Beam Diagnostics: Failed to converge fit. Data is too noisy.")
 
         self.status_label.setText("Analysis Complete.")
+        self.analyze_btn.setEnabled(True) 
         self.tabs.setCurrentIndex(1)
 
-    def download_kaggle_dataset(self):
-        selected_items = self.results_list.selectedItems()
-        if not selected_items:
-            return
-
-        item_text = selected_items[0].text()
-        
-        if "Authentication Required" in item_text or "No datasets found" in item_text:
-            return
-
-        try:
-            lines = item_text.split('\n')
-            ref_line = [line for line in lines if line.startswith("Ref:")][0]
-            dataset_ref = ref_line.replace("Ref:", "").strip()
-        except IndexError:
-            QMessageBox.warning(self, "Parse Error", "Could not extract dataset reference.")
-            return
-
-        download_dir = QFileDialog.getExistingDirectory(self, "Select Download Directory")
-        if not download_dir:
-            return 
-
-        self.results_list.addItem(f"Downloading '{dataset_ref}'... Please wait.")
-        self.download_btn.setEnabled(False) # Prevent clicking download twice
-        self.download_btn.setText("Downloading...")
-        
-        # Start the background thread
-        self.dl_thread = DownloadThread(self.scraper, dataset_ref, download_dir)
-        self.dl_thread.finished.connect(self.on_download_finished)
-        self.dl_thread.start()
-
-    def on_download_finished(self, success, msg):
-        # This runs when the background thread finishes
-        self.results_list.takeItem(self.results_list.count() - 1)
-        self.download_btn.setEnabled(True)
-        self.download_btn.setText("Download Selected Dataset")
-        
-        if success:
-            QMessageBox.information(self, "Download Complete", msg)
-        else:
-            QMessageBox.critical(self, "Download Error", msg)
+    def on_analysis_error(self, error_msg):
+        self.status_label.setText("Analysis Error!")
+        QMessageBox.critical(self, "Error", f"An error occurred during analysis:\n{error_msg}")
+        self.analyze_btn.setEnabled(True)
