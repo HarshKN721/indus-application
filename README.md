@@ -14,3 +14,4 @@ pip uninstall pyinstaller -y
 pip install pyinstaller --no-binary pyinstaller
 
 pip install PyQt6 pyqtgraph matplotlib scipy numpy opencv-python-headless kaggle pyinstaller
+pip install PyQt6 pyqtgraph matplotlib scipy numpy opencv-python pyinstaller (updated)
